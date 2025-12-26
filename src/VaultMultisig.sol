@@ -1,31 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-contract VaultMultisig {
+import "./IVaultMultisig.sol";
+
+/// @title VaultMultisig
+/// @notice A multi-signature vault contract that requires multiple approvals for transfers
+/// @author webb3george
+contract VaultMultisig is IVaultMultisig {
     uint256 public quorum;
 
     uint256 public transfersCount;
 
-    error SignersArrayCantBeEmpty();
-    error QuorumGreaterThanSigners();
-    error QuorumCannotBeZero();
-    error InvalidRecipient();
-    error InvalidAmount();
-    error InvalidMultiSigSigner();
-    error TransferAlreadyExecuted(uint256 _transferId);
-    error SignerAlreadyApproved(address _signer);
-    error NotEnoughApprovals();
-    error InsufficientContractBalance();
-    error TransferFailed(uint256 _transferId);
-
-    struct Transfer {
-        address to;
-        uint256 amount;
-        uint256 approvals;
-        bool executed;
-        mapping(address => bool) approved;
-    }
-
+    /// @notice Modifier to restrict function access to multi-signature signers only
     modifier onlyMultiSigSigner() {
         if (!multiSigSigners[msg.sender]) {
             revert InvalidMultiSigSigner();
@@ -33,16 +19,15 @@ contract VaultMultisig {
         _;
     }
 
-    event TransferInitiated(uint256 indexed transferId, address indexed to, uint256 amount);
-
-    event TransferApproved(uint256 indexed transferId, address indexed signer);
-
-    event TransferExecuted(uint256 indexed transferId, address indexed to, uint256 amount);
-
+    /// @dev Mapping to store transfer requests
     mapping(uint256 => Transfer) private transfers;
 
+    /// @dev Mapping to store multi-signature signers
     mapping(address => bool) private multiSigSigners;
 
+    /// @notice Constructor to initialize the multi-signature vault
+    /// @param _signers Array of multi-signature signer addresses
+    /// @param _quorum Number of required approvals for executing a transfer
     constructor(address[] memory _signers, uint256 _quorum) {
         if (_signers.length == 0) {
             revert SignersArrayCantBeEmpty();
@@ -60,6 +45,7 @@ contract VaultMultisig {
         quorum = _quorum;
     }
 
+    /// @inheritdoc IVaultMultisig
     function initiateTransfer(address _to, uint256 _amount) external onlyMultiSigSigner {
         if (_to == address(0)) {
             revert InvalidRecipient();
@@ -79,6 +65,7 @@ contract VaultMultisig {
         emit TransferInitiated(transferId, _to, _amount);
     }
 
+    /// @inheritdoc IVaultMultisig
     function approveTransfer(uint256 _transferId) external onlyMultiSigSigner {
         Transfer storage transfer = transfers[_transferId];
 
@@ -95,6 +82,7 @@ contract VaultMultisig {
         emit TransferApproved(_transferId, msg.sender);
     }
 
+    /// @inheritdoc IVaultMultisig
     function executeTransfer(uint256 _transferId) external onlyMultiSigSigner {
         Transfer storage transfer = transfers[_transferId];
 
@@ -119,6 +107,7 @@ contract VaultMultisig {
         emit TransferExecuted(_transferId, transfer.to, transfer.amount);
     }
 
+    /// @inheritdoc IVaultMultisig
     function getTransferInfo(uint256 _transferId)
         external
         view
@@ -128,14 +117,17 @@ contract VaultMultisig {
         return (transfer.to, transfer.amount, transfer.approvals, transfer.executed);
     }
 
+    /// @inheritdoc IVaultMultisig
     function hasSignerApproved(uint256 _transferId, address _signer) external view returns (bool) {
         Transfer storage transfer = transfers[_transferId];
         return transfer.approved[_signer];
     }
 
+    /// @inheritdoc IVaultMultisig
     function getTransferCount() external view returns (uint256) {
         return transfersCount;
     }
 
+    /// @notice Fallback function to accept Ether deposits
     receive() external payable {}
 }
