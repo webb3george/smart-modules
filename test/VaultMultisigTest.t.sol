@@ -161,25 +161,19 @@ contract VaultMultisigTest is Test {
     function test_updateSignersAndQuorumRevertsSignersArrayCannotBeEmpty() public {
         vm.startPrank(signer1);
         address[] memory empty;
-        vm.expectRevert(
-            VaultMultisig.SignersArrayCannotBeEmpty.selector
-        );
+        vm.expectRevert(VaultMultisig.SignersArrayCannotBeEmpty.selector);
         vault.updateSignersAndQuorum(empty, 3);
     }
 
     function test_updateSignersAndQuorumQuorumCannotBeZero() public {
         vm.startPrank(signer1);
-        vm.expectRevert(
-            VaultMultisig.QuorumCannotBeZero.selector
-        );
+        vm.expectRevert(VaultMultisig.QuorumCannotBeZero.selector);
         vault.updateSignersAndQuorum(signers, 0);
     }
 
     function test_updateSignersAndQuorumQuorumGreaterThanSigners() public {
         vm.startPrank(signer1);
-        vm.expectRevert(
-            VaultMultisig.QuorumGreaterThanSigners.selector
-        );
+        vm.expectRevert(VaultMultisig.QuorumGreaterThanSigners.selector);
         vault.updateSignersAndQuorum(signers, 4);
     }
 
