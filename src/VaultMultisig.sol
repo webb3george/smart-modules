@@ -52,6 +52,9 @@ contract VaultMultisig {
     /// @notice Checks that the signer is a multisig signer
     error InvalidMultisigSigner();
 
+    /// @notice Checks that the vault has funds
+    error VaultIsEmpty();
+
     /// @notice Checks that the balance is sufficient for the transfer
     error InsufficientBalance(uint256 balance, uint256 desiredAmount);
 
@@ -119,12 +122,13 @@ contract VaultMultisig {
     function initiateTransfer(address _to, uint256 _amount) external onlyMultisigSigner {
         if (_to == address(0)) revert InvalidRecipient();
         if (_amount <= 0) revert InvalidAmount();
+        if (address(this).balance <= 0) revert VaultIsEmpty();
 
         uint256 transferId = transfersCount++;
         Transfer storage transfer = transfers[transferId];
         transfer.to = _to;
         transfer.amount = _amount;
-        transfer.approvals = 0;
+        transfer.approvals = 1;
         transfer.executed = false;
         transfer.approved[msg.sender] = true;
 
@@ -150,7 +154,7 @@ contract VaultMultisig {
         if (transfer.executed) revert TransferIsAlreadyExecuted(_transferId);
 
         uint256 balance = address(this).balance;
-        if (transfer.amount >= balance) revert InsufficientBalance(balance, transfer.amount);
+        if (transfer.amount > balance) revert InsufficientBalance(balance, transfer.amount);
 
         (bool success,) = transfer.to.call{value: transfer.amount}("");
         if (!success) revert TransferFailed(_transferId);
