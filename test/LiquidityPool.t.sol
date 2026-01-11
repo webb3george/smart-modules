@@ -1,147 +1,171 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
 import "forge-std/Test.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "../src/LiquidityPool.sol";
 import "../src/FeeManager.sol";
 import "../src/EIP712Swap.sol";
-
-using ECDSA for bytes32;
-
-bytes32 constant SWAP_TYPEHASH = keccak256(
-    "SwapRequest(address pool,address sender,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 nonce,uint256 deadline)"
-);
-
-contract ERC20Mock is ERC20 {
-    constructor(string memory n, string memory s) ERC20(n, s) {}
-
-    function mint(address to, uint256 amt) external {
-        _mint(to, amt);
-    }
-}
+import "../src/Roles.sol"; // Import Roles library
+import "./MockERC20.sol";
 
 contract LiquidityPoolTest is Test {
-    uint256 constant ONE = 1 ether; // helper
-    address alice = vm.addr(1);
-    address bob = vm.addr(2);
+    LiquidityPool public pool;
+    FeeManager public feeManager;
+    EIP712Swap public eip712Swap;
+    MockERC20 public token0;
+    MockERC20 public token1;
 
-    ERC20Mock tokenA;
-    ERC20Mock tokenB;
-    FeeManager feeMgr;
-    EIP712Swap eip712;
-    LiquidityPool pool;
+    address public admin;
+    address public user;
 
     function setUp() public {
-        // 1. Deploy mocks
-        tokenA = new ERC20Mock("TokenA", "A");
-        tokenB = new ERC20Mock("TokenB", "B");
-        tokenA.mint(alice, 2_000 * ONE);
-        tokenB.mint(alice, 2_000 * ONE);
+        admin = address(this);
+        user = makeAddr("user");
 
-        // 2. Fee manager (30 bp = 0.30 %)
-        feeMgr = new FeeManager();
-        feeMgr.initialize(30);
+        // Deploy FeeManager with proxy
+        FeeManager feeManagerImpl = new FeeManager();
+        bytes memory initData = abi.encodeWithSignature("initialize(uint256)", 250);
+        ERC1967Proxy feeManagerProxy = new ERC1967Proxy(address(feeManagerImpl), initData);
+        feeManager = FeeManager(address(feeManagerProxy));
 
-        // 3. EIP-712 relay
-        eip712 = new EIP712Swap();
+        eip712Swap = new EIP712Swap();
 
-        // 4. Liquidity Pool (decimals = 18)
-        pool = new LiquidityPool(address(tokenA), 18, address(tokenB), 18, address(feeMgr), address(eip712));
-        pool.initialize(30); // gives deployer DEFAULT_ADMIN_ROLE
-    }
+        // Deploy tokens
+        token0 = new MockERC20("Token0", "TK0", 18, 1000000e18);
+        token1 = new MockERC20("Token1", "TK1", 6, 1000000e6);
 
-    /* ---------- Basic unit tests ---------- */
+        // Deploy pool
+        pool = new LiquidityPool(address(token0), 18, address(token1), 6, address(feeManager), address(eip712Swap));
 
-    /// Expect current addLiquidity implementation to revert (wrong check)
-    function testAddLiquidityShouldRevertUntilFixed() public {
-        vm.startPrank(alice);
-        tokenA.approve(address(pool), 100 * ONE);
-        // vm.expectRevert(LiquidityPool.InvalidTokenAddress.selector);
-        // pool.addLiquidity(address(tokenA), 100 * ONE);
-    }
+        // Setup user tokens
+        token0.mint(user, 10000e18);
+        token1.mint(user, 10000e6);
 
-    /// Manually seed reserves to test swap logic without touching addLiquidity
-    function _seedReserves(uint256 r0, uint256 r1) internal {
-        vm.startPrank(alice);
-        tokenA.approve(address(pool), r0);
-        tokenB.approve(address(pool), r1);
-        pool.addLiquidity(address(tokenA), r0);
-        pool.addLiquidity(address(tokenB), r1);
+        vm.startPrank(user);
+        token0.approve(address(pool), type(uint256).max);
+        token1.approve(address(pool), type(uint256).max);
         vm.stopPrank();
+
+        // Admin approvals
+        token0.approve(address(pool), type(uint256).max);
+        token1.approve(address(pool), type(uint256).max);
     }
 
-    /// Happy-path swap TokenA -> TokenB via pool.swap
-    function testSwapAforB() public {
-        _seedReserves(1_000 * ONE, 1_000 * ONE);
+    function test_RoleBasedAccess() public view {
+        // Admin should have ADMIN_ROLE - use Roles library
+        assertTrue(pool.hasRole(Roles.ADMIN_ROLE, admin));
 
-        uint256 amountIn = 100 * ONE;
-        uint256 minOut = 80 * ONE; // loose slippage for demo
+        // EIP712Swap should have ALLOWED_EIP712_SWAP_ROLE - use Roles library
+        assertTrue(pool.hasRole(Roles.ALLOWED_EIP712_SWAP_ROLE, address(eip712Swap)));
 
-        vm.startPrank(alice);
-        tokenA.approve(address(pool), amountIn);
-
-        uint256 balBBefore = tokenB.balanceOf(alice);
-        pool.swap(alice, address(tokenA), address(tokenB), amountIn, minOut);
-        uint256 balBAfter = tokenB.balanceOf(alice);
-
-        assertGt(balBAfter - balBBefore, 0, "got no tokens out");
+        // User should have no roles
+        assertFalse(pool.hasRole(Roles.ADMIN_ROLE, user));
+        assertFalse(pool.hasRole(Roles.ALLOWED_EIP712_SWAP_ROLE, user));
     }
 
-    /// Verify/execute EIP-712 meta-swap (off-chain signature)
-    function testRelaySwap() public {
-        _seedReserves(1_000 * ONE, 1_000 * ONE);
-
-        uint256 amountIn = 10 * ONE;
-        uint256 nonce = eip712.getNonce(alice);
-        uint256 deadline = block.timestamp + 1 hours;
-
-        ISwap.SwapRequest memory req = ISwap.SwapRequest({
-            pool: address(pool),
-            sender: alice,
-            tokenIn: address(tokenA),
-            tokenOut: address(tokenB),
-            amountIn: amountIn,
-            minAmountOut: 1,
-            nonce: nonce,
-            deadline: deadline
-        });
-
-        /* -- подпись -- */
-        bytes32 digest = _hash(req, eip712.getDomainSeparator());
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(1, digest);
-        bytes memory sig = abi.encodePacked(r, s, v);
-
-        /* -- подготовка токенов -- */
-        vm.prank(alice);
-        tokenA.approve(address(pool), amountIn);
-
-        /* -- вызов -- */
-        bool ok = eip712.executeSwap(req, sig);
-        assertTrue(ok);
+    function test_AddLiquidity() public {
+        pool.addLiquidity(address(token0), 1000e18);
+        assertEq(pool.reserveToken0(), 1000e18);
     }
 
-    /* ---------- internal helpers ---------- */
+    function test_AddLiquidity_RevertWhen_InvalidToken() public {
+        MockERC20 invalidToken = new MockERC20("Invalid", "INV", 18, 1000e18);
+        vm.expectRevert(abi.encodeWithSelector(LiquidityPool.InvalidTokenAddress.selector, address(invalidToken)));
+        pool.addLiquidity(address(invalidToken), 1000e18);
+    }
 
-    function _hash(ISwap.SwapRequest memory req, bytes32 domainSeparator) internal pure returns (bytes32) {
-        /* 1. structHash */
-        bytes32 structHash = keccak256(
-            abi.encode(
-                SWAP_TYPEHASH,
-                req.pool,
-                req.sender,
-                req.tokenIn,
-                req.tokenOut,
-                req.amountIn,
-                req.minAmountOut,
-                req.nonce,
-                req.deadline
-            )
-        );
+    function test_AddLiquidity_RevertWhen_NotAdmin() public {
+        vm.prank(user);
+        vm.expectRevert();
+        pool.addLiquidity(address(token0), 1000e18);
+    }
 
-        /* 2. EIP-712 digest = keccak256("\x19\x01", domainSeparator, structHash) */
-        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    function test_Swap() public {
+        // Add liquidity
+        pool.addLiquidity(address(token0), 10000e18);
+        pool.addLiquidity(address(token1), 20000e6);
+
+        uint256 userBalanceBefore = token0.balanceOf(user);
+
+        pool.swap(user, address(token0), address(token1), 100e18, 0);
+
+        assertEq(token0.balanceOf(user), userBalanceBefore - 100e18);
+        assertGt(token1.balanceOf(user), 10000e6); // Should receive some token1
+    }
+
+    function test_EIP712SwapCanExecuteSwap() public {
+        // Add liquidity
+        pool.addLiquidity(address(token0), 10000e18);
+        pool.addLiquidity(address(token1), 20000e6);
+
+        uint256 userBalanceBefore = token0.balanceOf(user);
+
+        // EIP712Swap contract can call swap because it has ALLOWED_EIP712_SWAP_ROLE
+        vm.prank(address(eip712Swap));
+        pool.swap(user, address(token0), address(token1), 100e18, 0);
+
+        assertEq(token0.balanceOf(user), userBalanceBefore - 100e18);
+    }
+
+    function test_GrantAndRevokeSwapRole() public {
+        address newSwapper = makeAddr("newSwapper");
+
+        // Initially should not have role
+        assertFalse(pool.hasRole(Roles.ALLOWED_EIP712_SWAP_ROLE, newSwapper));
+
+        // Grant role
+        pool.grantSwapRole(newSwapper);
+        assertTrue(pool.hasRole(Roles.ALLOWED_EIP712_SWAP_ROLE, newSwapper));
+
+        // Revoke role
+        pool.revokeSwapRole(newSwapper);
+        assertFalse(pool.hasRole(Roles.ALLOWED_EIP712_SWAP_ROLE, newSwapper));
+    }
+
+    function test_OnlyAuthorizedCanSwap() public {
+        pool.addLiquidity(address(token0), 10000e18);
+        pool.addLiquidity(address(token1), 20000e6);
+
+        // Random user cannot call swap
+        vm.prank(user);
+        vm.expectRevert("Not authorized for swap operations");
+        pool.swap(user, address(token0), address(token1), 100e18, 0);
+    }
+
+    function test_RemoveLiquidity() public {
+        // Add liquidity first
+        pool.addLiquidity(address(token0), 1000e18);
+        assertEq(pool.reserveToken0(), 1000e18);
+
+        uint256 balanceBefore = token0.balanceOf(admin);
+
+        // Remove some liquidity
+        pool.removeLiquidity(address(token0), 500e18);
+
+        assertEq(pool.reserveToken0(), 500e18);
+        assertEq(token0.balanceOf(admin), balanceBefore + 500e18);
+    }
+
+    function test_Swap_RevertWhen_InsufficientLiquidity() public {
+        pool.addLiquidity(address(token0), 100e18);
+        pool.addLiquidity(address(token1), 50e6);
+
+        vm.expectRevert(LiquidityPool.InsufficientLiquidity.selector);
+        pool.swap(user, address(token0), address(token1), 100e18, 0); // 100% of reserves
+    }
+
+    function test_Swap_RevertWhen_InvalidTokenPair() public {
+        MockERC20 invalidToken = new MockERC20("Invalid", "INV", 18, 1000e18);
+        vm.expectRevert();
+        pool.swap(user, address(invalidToken), address(token1), 100e18, 1);
+    }
+
+    function test_GetPrice() public {
+        pool.addLiquidity(address(token0), 1000e18);
+        pool.addLiquidity(address(token1), 2000e6);
+
+        uint256 price = pool.getPrice(address(token0), address(token1));
+        assertGt(price, 0);
     }
 }
